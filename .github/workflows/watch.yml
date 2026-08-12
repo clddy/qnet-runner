@@ -1,0 +1,67 @@
+name: watch
+
+# 큐넷 접수현황 감시. 산출물은 비공개 코어 저장소의 data/ 에 커밋된다.
+on:
+  schedule:
+    # 매시 05분(UTC). KST 도 시간 오프셋이 정수라 매시 05분에 돈다.
+    # 깃헙 크론은 수 분~십수 분 지연이 흔하다 — 무장 모드가 한 실행 안에서
+    # 50분을 이어 보므로 그 지연은 사실상 흡수된다.
+    - cron: '5 * * * *'
+  workflow_dispatch:
+
+# 앞 실행이 무장 모드로 길어졌을 때 겹쳐 돌지 않게 한다.
+# 취소하지 않고 기다리게 두면 큐가 밀리므로, 새 실행을 버린다.
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60          # 무장 모드 최대 50분 + 여유
+    steps:
+      - name: 러너 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 코어 체크아웃 (비공개)
+        uses: actions/checkout@v4
+        with:
+          repository: clddy/qnet-watcher
+          ssh-key: ${{ secrets.CORE_SSH_KEY }}
+          path: core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 코어는 표준 라이브러리만 쓴다 — 의존성 설치 단계가 없다.
+      - name: 감시 실행
+        run: python -X utf8 run.py
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # 큐넷이 죽어 실행이 실패해도 그때까지 모은 것은 남긴다.
+      - name: 산출물 커밋
+        if: always()
+        working-directory: core
+        run: |
+          git config user.name  "qnet-watcher[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "변경 없음 — 커밋 생략"
+            exit 0
+          fi
+          git commit -m "watch: $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M KST')"
+          # 다른 실행이 먼저 밀어넣었을 수 있다. 리베이스 후 재시도.
+          for i in 1 2 3; do
+            git pull --rebase --quiet origin main && git push --quiet origin HEAD:main && exit 0
+            echo "푸시 재시도 $i"
+            sleep 5
+          done
+          exit 1
