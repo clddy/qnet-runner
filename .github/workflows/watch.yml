@@ -3,11 +3,17 @@ name: watch
 # 큐넷 접수현황 감시. 산출물은 비공개 코어 저장소의 data/ 에 커밋된다.
 on:
   schedule:
-    # 매시 05분(UTC). KST 도 시간 오프셋이 정수라 매시 05분에 돈다.
-    # 깃헙 크론은 수 분~십수 분 지연이 흔하다 — 무장 모드가 한 실행 안에서
-    # 50분을 이어 보므로 그 지연은 사실상 흡수된다.
-    - cron: '5 * * * *'
+    # 20분마다. 깃헙 예약 실행은 지연·누락이 흔해서(실측 56~156분 간격 발화)
+    # 매시로 걸면 실제로는 두 시간에 한 번 도는 날이 생긴다.
+    # 자주 걸어 두면 앞 실행이 끝나는 순간 대기하던 실행이 바로 이어받는다.
+    # 동시성 그룹이 중복 실행을 막으므로 자주 걸어도 겹치지 않는다.
+    - cron: '*/20 * * * *'
   workflow_dispatch:
+    inputs:
+      alert_test:
+        description: '실패 알림이 실제로 도착하는지만 시험한다(감시는 건너뜀)'
+        type: boolean
+        default: false
 
 # 앞 실행이 무장 모드로 길어졌을 때 겹쳐 돌지 않게 한다.
 # 취소하지 않고 기다리게 두면 큐가 밀리므로, 새 실행을 버린다.
@@ -20,7 +26,7 @@ permissions: {}
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 60          # 무장 모드 최대 50분 + 여유
+    timeout-minutes: 345         # 무장 모드 최대 330분 + 여유 (깃헙 상한 360분)
     steps:
       - name: 러너 체크아웃
         uses: actions/checkout@v4
@@ -38,32 +44,47 @@ jobs:
 
       # 코어는 표준 라이브러리만 쓴다 — 의존성 설치 단계가 없다.
       - name: 감시 실행
+        if: ${{ github.event.inputs.alert_test != 'true' }}
         run: python -X utf8 run.py
         env:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: '1'
+          # 크론 발화가 들쭉날쭉해도 감시가 끊기지 않도록 한 실행을 길게 잡는다.
+          # 창이 아닌 날은 무장이 안 켜지므로 몇 초 만에 끝난다.
+          QNET_ARMED_MINUTES: '330'
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       # 실행이 실패하면 반드시 알린다.
       # 2026-08-14: 알림 조립에서 죽은 실행이 7시간 동안 아무에게도 안 알려졌다.
       # 워처가 "조용히 틀리지 않는다"를 지키려면 워처 자신의 죽음부터 시끄러워야 한다.
+      # alert_test 로 수동 실행하면 장애 없이도 이 단계를 태워 볼 수 있다.
+      # 알림은 마지막 방어선이라 "아마 될 것"으로 두면 안 된다.
       - name: 실패 알림
-        if: failure()
+        if: ${{ failure() || github.event.inputs.alert_test == 'true' }}
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IS_TEST: ${{ github.event.inputs.alert_test }}
         run: |
+          if [ "$IS_TEST" = "true" ]; then
+            HEAD='[테스트] 실패 알림 점검 — 실제 장애 아님'
+          else
+            HEAD='❌ 큐넷 워처 실행 실패'
+          fi
           MSG=$(printf '%s\n%s\n%s\n%s' \
-            '❌ 큐넷 워처 실행 실패' \
+            "$HEAD" \
             "$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M KST')" \
             '감시가 멈췄을 수 있다. 로그 확인:' \
             "$RUN_URL")
-          curl -sS -o /dev/null -X POST \
+          # 전송 결과를 확인한다. 알림이 조용히 실패하면 알림이 없는 것과 같다.
+          RESP=$(curl -sS -X POST \
             "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT}" \
-            --data-urlencode "text=${MSG}"
+            --data-urlencode "text=${MSG}")
+          echo "telegram: $RESP"
+          echo "$RESP" | grep -q '"ok":true' || { echo "::error::텔레그램 전송 실패"; exit 1; }
 
       # 큐넷이 죽어 실행이 실패해도 그때까지 모은 것은 남긴다.
       - name: 산출물 커밋
